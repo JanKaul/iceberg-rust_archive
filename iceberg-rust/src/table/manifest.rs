@@ -3,7 +3,7 @@
 */
 
 use std::{
-    io::Read,
+    io::{Cursor, Read},
     iter::{repeat, Map, Repeat, Zip},
     sync::Arc,
 };
@@ -100,6 +100,24 @@ impl<'a, R: Read> ManifestReader<'a, R> {
                 .zip(repeat(Arc::new((schema, partition_spec, format_version))))
                 .map(avro_value_to_manifest_entry),
         })
+    }
+}
+
+impl ManifestReader<'static, Cursor<Vec<u8>>> {
+    /// Read a manifest directly from a an object store
+    pub async fn from_object_store(
+        object_store: Arc<dyn ObjectStore>,
+        manifest_path: &str,
+    ) -> Result<Self, Error> {
+        let manifest_bytes: Vec<u8> = object_store
+            .get(&strip_prefix(manifest_path).as_str().into())
+            .await?
+            .bytes()
+            .await?
+            .into();
+
+        let cursor = Cursor::new(manifest_bytes);
+        ManifestReader::new(cursor)
     }
 }
 
@@ -258,19 +276,13 @@ impl<'schema, 'metadata> ManifestWriter<'schema, 'metadata> {
         writer.extend(
             manifest_reader
                 .map(|entry| {
-                    let mut entry = entry
-                        .map_err(|err| apache_avro::Error::DeserializeValue(err.to_string()))?;
-                    *entry.status_mut() = Status::Existing;
-                    if entry.sequence_number().is_none() {
-                        *entry.sequence_number_mut() =
-                            table_metadata.sequence_number(entry.snapshot_id().ok_or(
-                                apache_avro::Error::DeserializeValue(
-                                    "Snapshot_id missing in Manifest Entry.".to_owned(),
-                                ),
-                            )?);
+                    let mut entry = entry?;
+                    if *entry.status() == Status::Added {
+                        entry.mark_existing(table_metadata)?;
                     }
-                    to_value(entry)
+                    to_value(entry).map_err(Error::from)
                 })
+                // TODO avoid swallowing errors silently
                 .filter_map(Result::ok),
         )?;
 

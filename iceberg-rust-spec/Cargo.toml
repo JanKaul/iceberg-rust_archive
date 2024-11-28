@@ -28,3 +28,6 @@ url = { workspace = true }
 derive_builder = "0.12.0"
 thiserror = { workspace = true }
 derive-getters = { workspace = true }
+
+[features]
+testutils = []

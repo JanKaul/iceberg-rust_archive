@@ -42,6 +42,13 @@ impl Schema {
     pub fn builder() -> SchemaBuilder {
         SchemaBuilder::default()
     }
+
+    /// A [`Schema`] from a V2 JSON string literal for tests
+    #[cfg(any(test, feature = "testutils"))]
+    pub fn from_json(json_record: &'static str) -> Self {
+        let result: SchemaV2 = serde_json::from_str(json_record).unwrap();
+        result.try_into().unwrap()
+    }
 }
 
 impl fmt::Display for Schema {

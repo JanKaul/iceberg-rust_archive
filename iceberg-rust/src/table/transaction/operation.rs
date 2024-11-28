@@ -4,22 +4,18 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use iceberg_rust_spec::manifest_list::{manifest_list_schema_v1, manifest_list_schema_v2};
 use iceberg_rust_spec::spec::table_metadata::TableMetadata;
 use iceberg_rust_spec::spec::{
-    manifest::{partition_value_schema, DataFile, ManifestEntry, Status},
+    manifest::{DataFile, ManifestEntry, Status},
     schema::Schema,
-    snapshot::{
-        generate_snapshot_id, SnapshotBuilder, SnapshotReference, SnapshotRetention, Summary,
-    },
+    snapshot::{Operation as SpecOperation, SnapshotReference, SnapshotRetention},
 };
-use iceberg_rust_spec::table_metadata::FormatVersion;
-use iceberg_rust_spec::util::strip_prefix;
 use object_store::ObjectStore;
 use smallvec::SmallVec;
 
-use crate::table::manifest::{ManifestReader, ManifestWriter};
-use crate::table::manifest_list::ManifestListReader;
+use crate::table::manifest::ManifestReader;
+use crate::table::manifest_list::{ManifestListReader, ManifestListWriter};
+
 use crate::{
     catalog::commit::{TableRequirement, TableUpdate},
     error::Error,
@@ -59,7 +55,7 @@ pub enum Operation {
     //     paths: Vec<String>,
     //     partition_values: Vec<Struct>,
     // },
-    // /// Replace files in the table and commit
+    /// Replace all files in the table and commit
     Rewrite {
         branch: Option<String>,
         files: Vec<DataFile>,
@@ -118,29 +114,21 @@ impl Operation {
                         "rectangle".to_owned(),
                     ))?;
 
-                let manifest_list_schema = match table_metadata.format_version {
-                    FormatVersion::V1 => manifest_list_schema_v1(),
-                    FormatVersion::V2 => manifest_list_schema_v2(),
-                };
-
-                let mut manifest_list_writer =
-                    apache_avro::Writer::new(manifest_list_schema, Vec::new());
-
-                let old_manifest_list_location = old_snapshot.map(|x| x.manifest_list()).cloned();
+                let mut manifest_list_writer = ManifestListWriter::try_new(
+                    object_store.clone(),
+                    table_metadata,
+                    branch.clone(),
+                )?;
 
                 // Find a manifest to add the new datafiles
                 let mut existing_file_count = 0;
-                let selected_manifest_opt = if let Some(old_manifest_list_location) =
-                    &old_manifest_list_location
-                {
-                    let old_manifest_list_bytes = object_store
-                        .get(&strip_prefix(old_manifest_list_location).as_str().into())
-                        .await?
-                        .bytes()
-                        .await?;
-
-                    let manifest_list_reader =
-                        ManifestListReader::new(old_manifest_list_bytes.as_ref(), table_metadata)?;
+                let selected_manifest_opt = if let Some(old_snapshot) = old_snapshot {
+                    let manifest_list_reader = ManifestListReader::from_snapshot(
+                        old_snapshot,
+                        table_metadata,
+                        object_store.clone(),
+                    )
+                    .await?;
 
                     let SelectedManifest {
                         manifest,
@@ -196,177 +184,82 @@ impl Operation {
                     })
                     .unwrap_or(bounding_partition_values);
 
-                let snapshot_id = generate_snapshot_id();
-                let snapshot_uuid = &uuid::Uuid::new_v4().to_string();
+                let new_manifest_entries = new_files
+                    .into_iter()
+                    .map(|data_file| {
+                        ManifestEntry::builder()
+                            .with_format_version(table_metadata.format_version)
+                            .with_status(Status::Added)
+                            .with_snapshot_id(manifest_list_writer.snapshot_id())
+                            .with_data_file(data_file)
+                            .build()
+                            .map_err(crate::spec::error::Error::from)
+                            .map_err(Error::from)
+                    })
+                    .collect::<Result<_, Error>>()?;
 
-                let new_datafile_iter = new_files.into_iter().map(|data_file| {
-                    ManifestEntry::builder()
-                        .with_format_version(table_metadata.format_version)
-                        .with_status(Status::Added)
-                        .with_snapshot_id(snapshot_id)
-                        .with_data_file(data_file)
-                        .build()
-                        .map_err(crate::spec::error::Error::from)
-                        .map_err(Error::from)
-                });
-
-                let manifest_schema = ManifestEntry::schema(
-                    &partition_value_schema(&partition_fields)?,
-                    &table_metadata.format_version,
-                )?;
-
-                let new_manifest_list_location = table_metadata.location.to_string()
-                    + "/metadata/snap-"
-                    + &snapshot_id.to_string()
-                    + "-"
-                    + snapshot_uuid
-                    + ".avro";
-
-                // Write manifest files
-                // Split manifest file if limit is exceeded
+                // Write manifest files, splitting them if the limit is exceeded
                 if n_splits == 0 {
-                    let mut manifest_writer = if let Some(manifest) = selected_manifest_opt {
-                        let manifest_bytes: Vec<u8> = object_store
-                            .get(&strip_prefix(&manifest.manifest_path).as_str().into())
-                            .await?
-                            .bytes()
-                            .await?
-                            .into();
-
-                        ManifestWriter::from_existing(
-                            &manifest_bytes,
-                            manifest,
-                            &manifest_schema,
-                            table_metadata,
-                            branch.as_deref(),
-                        )?
+                    if let Some(manifest) = selected_manifest_opt {
+                        manifest_list_writer
+                            .append_manifests_entries_to_existing_manifest(
+                                manifest,
+                                new_manifest_entries,
+                            )
+                            .await?;
                     } else {
-                        let manifest_location = table_metadata.location.to_string()
-                            + "/metadata/"
-                            + snapshot_uuid
-                            + "-m"
-                            + &0.to_string()
-                            + ".avro";
-
-                        ManifestWriter::new(
-                            &manifest_location,
-                            snapshot_id,
-                            &manifest_schema,
-                            table_metadata,
-                            branch.as_deref(),
-                        )?
+                        manifest_list_writer
+                            .append_manifest_entries_to_new_manifests(vec![new_manifest_entries])
+                            .await?;
                     };
-
-                    for manifest_entry in new_datafile_iter {
-                        manifest_writer.append(manifest_entry?)?;
-                    }
-
-                    let manifest = manifest_writer.finish(object_store.clone()).await?;
-
-                    manifest_list_writer.append_ser(manifest)?;
                 } else {
-                    // Split datafiles
-                    let splits = if let Some(manifest) = selected_manifest_opt {
-                        let manifest_bytes: Vec<u8> = object_store
-                            .get(&strip_prefix(&manifest.manifest_path).as_str().into())
-                            .await?
-                            .bytes()
-                            .await?
-                            .into();
-
-                        let manifest_reader = ManifestReader::new(&*manifest_bytes)?
-                            .map(|x| x.map_err(Error::from))
+                    let existing_manifest_entries = if let Some(manifest) = selected_manifest_opt {
+                        let manifest_reader = ManifestReader::from_object_store(
+                            object_store.clone(),
+                            &manifest.manifest_path,
+                        )
+                        .await?;
+                        manifest_reader
                             .map(|entry| {
                                 let mut entry = entry?;
-                                *entry.status_mut() = Status::Existing;
-                                if entry.sequence_number().is_none() {
-                                    *entry.sequence_number_mut() =
-                                        table_metadata.sequence_number(entry.snapshot_id().ok_or(
-                                            apache_avro::Error::DeserializeValue(
-                                                "Snapshot_id missing in Manifest Entry.".to_owned(),
-                                            ),
-                                        )?);
+                                if *entry.status() == Status::Added {
+                                    entry.mark_existing(table_metadata)?;
                                 }
                                 Ok(entry)
-                            });
-
-                        split_datafiles(
-                            new_datafile_iter.chain(manifest_reader),
-                            bounds,
-                            &partition_column_names,
-                            n_splits,
-                        )?
+                            })
+                            .collect::<Result<_, Error>>()?
                     } else {
-                        split_datafiles(
-                            new_datafile_iter,
-                            bounds,
-                            &partition_column_names,
-                            n_splits,
-                        )?
+                        vec![]
                     };
-
-                    for (i, entries) in splits.into_iter().enumerate() {
-                        let manifest_location = table_metadata.location.to_string()
-                            + "/metadata/"
-                            + snapshot_uuid
-                            + "-m"
-                            + &i.to_string()
-                            + ".avro";
-
-                        let mut manifest_writer = ManifestWriter::new(
-                            &manifest_location,
-                            snapshot_id,
-                            &manifest_schema,
-                            table_metadata,
-                            branch.as_deref(),
-                        )?;
-
-                        for manifest_entry in entries {
-                            manifest_writer.append(manifest_entry)?;
-                        }
-
-                        let manifest = manifest_writer.finish(object_store.clone()).await?;
-
-                        manifest_list_writer.append_ser(manifest)?;
-                    }
+                    let splits = split_datafiles(
+                        existing_manifest_entries
+                            .into_iter()
+                            .chain(new_manifest_entries)
+                            .collect(),
+                        bounds,
+                        &partition_column_names,
+                        n_splits,
+                    )?;
+                    manifest_list_writer
+                        .append_manifest_entries_to_new_manifests(splits)
+                        .await?;
                 };
 
-                let manifest_list_bytes = manifest_list_writer.into_inner()?;
-
-                object_store
-                    .put(
-                        &strip_prefix(&new_manifest_list_location).into(),
-                        manifest_list_bytes.into(),
-                    )
+                let branch = branch.unwrap_or("main".to_owned());
+                let snapshot = manifest_list_writer
+                    .finish(SpecOperation::Append, additional_summary, schema)
                     .await?;
-
-                let mut snapshot_builder = SnapshotBuilder::default();
-                snapshot_builder
-                    .with_snapshot_id(snapshot_id)
-                    .with_manifest_list(new_manifest_list_location)
-                    .with_sequence_number(
-                        old_snapshot
-                            .map(|x| *x.sequence_number() + 1)
-                            .unwrap_or_default(),
-                    )
-                    .with_summary(Summary {
-                        operation: iceberg_rust_spec::spec::snapshot::Operation::Append,
-                        other: additional_summary.unwrap_or_default(),
-                    })
-                    .with_schema_id(*schema.schema_id());
-                let snapshot = snapshot_builder
-                    .build()
-                    .map_err(iceberg_rust_spec::error::Error::from)?;
+                let snapshot_id = *snapshot.snapshot_id();
 
                 Ok((
                     old_snapshot.map(|x| TableRequirement::AssertRefSnapshotId {
-                        r#ref: branch.clone().unwrap_or("main".to_owned()),
+                        r#ref: branch.clone(),
                         snapshot_id: *x.snapshot_id(),
                     }),
                     vec![
                         TableUpdate::AddSnapshot { snapshot },
                         TableUpdate::SetSnapshotRef {
-                            ref_name: branch.unwrap_or("main".to_owned()),
+                            ref_name: branch,
                             snapshot_reference: SnapshotReference {
                                 snapshot_id,
                                 retention: SnapshotRetention::default(),
@@ -405,127 +298,50 @@ impl Operation {
                         "rectangle".to_owned(),
                     ))?;
 
-                let manifest_list_schema = match table_metadata.format_version {
-                    FormatVersion::V1 => manifest_list_schema_v1(),
-                    FormatVersion::V2 => manifest_list_schema_v2(),
-                };
-
-                let mut manifest_list_writer =
-                    apache_avro::Writer::new(manifest_list_schema, Vec::new());
+                let mut manifest_list_writer = ManifestListWriter::try_new(
+                    object_store.clone(),
+                    table_metadata,
+                    branch.clone(),
+                )?;
 
                 let n_splits = compute_n_splits(0, files.len(), 0);
 
-                let snapshot_id = generate_snapshot_id();
-                let sequence_number = table_metadata.last_sequence_number + 1;
+                let new_datafiles = files
+                    .into_iter()
+                    .map(|data_file| {
+                        ManifestEntry::builder()
+                            .with_format_version(table_metadata.format_version)
+                            .with_status(Status::Added)
+                            .with_snapshot_id(manifest_list_writer.snapshot_id())
+                            .with_data_file(data_file)
+                            .build()
+                            .map_err(crate::spec::error::Error::from)
+                            .map_err(Error::from)
+                    })
+                    .collect::<Result<_, Error>>()?;
 
-                let new_datafile_iter = files.into_iter().map(|data_file| {
-                    ManifestEntry::builder()
-                        .with_format_version(table_metadata.format_version)
-                        .with_status(Status::Added)
-                        .with_snapshot_id(snapshot_id)
-                        .with_sequence_number(sequence_number)
-                        .with_data_file(data_file)
-                        .build()
-                        .map_err(crate::spec::error::Error::from)
-                        .map_err(Error::from)
-                });
-
-                let manifest_schema = ManifestEntry::schema(
-                    &partition_value_schema(&partition_fields)?,
-                    &table_metadata.format_version,
-                )?;
-
-                let snapshot_uuid = &uuid::Uuid::new_v4().to_string();
-                let new_manifest_list_location = table_metadata.location.to_string()
-                    + "/metadata/snap-"
-                    + &snapshot_id.to_string()
-                    + "-"
-                    + snapshot_uuid
-                    + ".avro";
-
-                // Write manifest files
-                // Split manifest file if limit is exceeded
+                // Write manifest files, splitting tem if the limit is exceeded
                 if n_splits == 0 {
-                    // If manifest doesn't need to be split
-
-                    let manifest_location = table_metadata.location.to_string()
-                        + "/metadata/"
-                        + snapshot_uuid
-                        + "-m"
-                        + &0.to_string()
-                        + ".avro";
-                    let mut manifest_writer = ManifestWriter::new(
-                        &manifest_location,
-                        snapshot_id,
-                        &manifest_schema,
-                        table_metadata,
-                        branch.as_deref(),
-                    )?;
-
-                    for manifest_entry in new_datafile_iter {
-                        manifest_writer.append(manifest_entry?)?;
-                    }
-
-                    let manifest = manifest_writer.finish(object_store.clone()).await?;
-
-                    manifest_list_writer.append_ser(manifest)?;
+                    manifest_list_writer
+                        .append_manifest_entries_to_new_manifests(vec![new_datafiles])
+                        .await?;
                 } else {
-                    // Split datafiles
                     let splits = split_datafiles(
-                        new_datafile_iter,
+                        new_datafiles,
                         bounding_partition_values,
                         &partition_column_names,
                         n_splits,
                     )?;
 
-                    for (i, entries) in splits.into_iter().enumerate() {
-                        let manifest_location = table_metadata.location.to_string()
-                            + "/metadata/"
-                            + snapshot_uuid
-                            + "-m"
-                            + &i.to_string()
-                            + ".avro";
-
-                        let mut manifest_writer = ManifestWriter::new(
-                            &manifest_location,
-                            snapshot_id,
-                            &manifest_schema,
-                            table_metadata,
-                            branch.as_deref(),
-                        )?;
-
-                        for manifest_entry in entries {
-                            manifest_writer.append(manifest_entry)?;
-                        }
-
-                        let manifest = manifest_writer.finish(object_store.clone()).await?;
-
-                        manifest_list_writer.append_ser(manifest)?;
-                    }
+                    manifest_list_writer
+                        .append_manifest_entries_to_new_manifests(splits)
+                        .await?;
                 };
 
-                let manifest_list_bytes = manifest_list_writer.into_inner()?;
-
-                object_store
-                    .put(
-                        &strip_prefix(&new_manifest_list_location).into(),
-                        manifest_list_bytes.into(),
-                    )
+                let new_snapshot_id = manifest_list_writer.snapshot_id();
+                let snapshot = manifest_list_writer
+                    .finish(SpecOperation::Overwrite, additional_summary, &schema)
                     .await?;
-
-                let mut snapshot_builder = SnapshotBuilder::default();
-                snapshot_builder
-                    .with_snapshot_id(snapshot_id)
-                    .with_sequence_number(0)
-                    .with_schema_id(*schema.schema_id())
-                    .with_manifest_list(new_manifest_list_location)
-                    .with_summary(Summary {
-                        operation: iceberg_rust_spec::spec::snapshot::Operation::Append,
-                        other: additional_summary.unwrap_or_default(),
-                    });
-                let snapshot = snapshot_builder
-                    .build()
-                    .map_err(iceberg_rust_spec::error::Error::from)?;
 
                 let old_snapshot_ids: Vec<i64> =
                     table_metadata.snapshots.keys().map(Clone::clone).collect();
@@ -543,7 +359,7 @@ impl Operation {
                         TableUpdate::SetSnapshotRef {
                             ref_name: branch.unwrap_or("main".to_owned()),
                             snapshot_reference: SnapshotReference {
-                                snapshot_id,
+                                snapshot_id: new_snapshot_id,
                                 retention: SnapshotRetention::default(),
                             },
                         },

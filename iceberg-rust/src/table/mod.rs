@@ -5,7 +5,7 @@ Defining the [Table] struct that represents an iceberg table.
 use std::{io::Cursor, sync::Arc};
 
 use manifest::ManifestReader;
-use manifest_list::read_snapshot;
+use manifest_list::ManifestListReader;
 use object_store::{path::Path, ObjectStore};
 
 use futures::{
@@ -129,7 +129,9 @@ impl Table {
                         Some(sequence_number)
                     }
                 });
-        let iter = read_snapshot(end_snapshot, metadata, self.object_store().clone()).await?;
+        let iter =
+            ManifestListReader::from_snapshot(end_snapshot, metadata, self.object_store().clone())
+                .await?;
         match start_sequence_number {
             Some(start) => iter
                 .filter(|manifest| {
@@ -221,9 +223,10 @@ pub(crate) async fn delete_files(
     let Some(snapshot) = metadata.current_snapshot(None)? else {
         return Ok(());
     };
-    let manifests: Vec<ManifestListEntry> = read_snapshot(snapshot, metadata, object_store.clone())
-        .await?
-        .collect::<Result<_, _>>()?;
+    let manifests: Vec<ManifestListEntry> =
+        ManifestListReader::from_snapshot(snapshot, metadata, object_store.clone())
+            .await?
+            .collect::<Result<_, _>>()?;
 
     let datafiles = datafiles(object_store.clone(), &manifests, None).await?;
     let snapshots = &metadata.snapshots;

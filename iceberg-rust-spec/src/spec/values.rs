@@ -207,6 +207,13 @@ impl Struct {
                 .collect::<Result<Vec<_>, Error>>()?,
         ))
     }
+
+    pub fn unpartitioned() -> Self {
+        Struct {
+            fields: Vec::new(),
+            lookup: BTreeMap::new(),
+        }
+    }
 }
 
 impl FromIterator<(String, Option<Value>)> for Struct {

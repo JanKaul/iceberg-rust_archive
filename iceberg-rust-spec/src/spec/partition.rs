@@ -191,6 +191,13 @@ impl PartitionSpec {
             })
             .collect::<Result<Vec<_>, Error>>()
     }
+
+    pub fn unpartitioned(spec_id: i32) -> Self {
+        Self {
+            spec_id,
+            fields: vec![],
+        }
+    }
 }
 
 impl fmt::Display for PartitionSpec {

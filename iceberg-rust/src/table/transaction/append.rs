@@ -1,17 +1,17 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, io::Read};
 
 use iceberg_rust_spec::{manifest::ManifestEntry, manifest_list::ManifestListEntry};
 
 use crate::{
     error::Error,
-    table::manifest_list::ManifestListReader,
+    table::manifest_list::{ManifestListReader, ManifestListWriter},
     util::{cmp_with_priority, partition_struct_to_vec, summary_to_rectangle, try_sub, Rectangle},
 };
 
 /// Split sets of datafiles depending on their partition_values
 #[allow(clippy::type_complexity)]
 fn split_datafiles_once(
-    files: impl Iterator<Item = Result<ManifestEntry, Error>>,
+    files: Vec<ManifestEntry>,
     rect: Rectangle,
     names: &[&str],
 ) -> Result<[(Vec<ManifestEntry>, Rectangle); 2], Error> {
@@ -21,7 +21,6 @@ fn split_datafiles_once(
     let mut larger_rect = None;
 
     for manifest_entry in files {
-        let manifest_entry = manifest_entry?;
         let position = partition_struct_to_vec(manifest_entry.data_file().partition(), names)?;
         // Compare distance to upper and lower bound. Since you can't compute a "norm" for a multidimensional vector where the dimensions have different datatypes,
         // the dimensions are compared individually and the norm is computed by weighing the earlier columns more than the later.
@@ -62,7 +61,7 @@ fn split_datafiles_once(
 
 /// Splits the datafiles *n_split* times to decrease the number of datafiles per maniefst. Returns *2^n_splits* lists of manifest entries.
 pub(crate) fn split_datafiles(
-    files: impl Iterator<Item = Result<ManifestEntry, Error>>,
+    files: Vec<ManifestEntry>,
     rect: Rectangle,
     names: &[&str],
     n_split: u32,
@@ -72,14 +71,8 @@ pub(crate) fn split_datafiles(
     if n_split == 1 {
         Ok(vec![smaller, larger])
     } else {
-        let mut smaller = split_datafiles(
-            smaller.into_iter().map(Ok),
-            smaller_rect,
-            names,
-            n_split - 1,
-        )?;
-        let mut larger =
-            split_datafiles(larger.into_iter().map(Ok), larger_rect, names, n_split - 1)?;
+        let mut smaller = split_datafiles(smaller, smaller_rect, names, n_split - 1)?;
+        let mut larger = split_datafiles(larger, larger_rect, names, n_split - 1)?;
 
         smaller.append(&mut larger);
         Ok(smaller)
@@ -94,8 +87,8 @@ pub(crate) struct SelectedManifest {
 /// Select the manifest that yields the smallest bounding rectangle after the
 /// bounding rectangle of the new values has been added.
 pub(crate) fn select_manifest_partitioned(
-    manifest_list_reader: ManifestListReader<&[u8]>,
-    manifest_list_writer: &mut apache_avro::Writer<Vec<u8>>,
+    manifest_list_reader: ManifestListReader<impl Read>,
+    manifest_list_writer: &mut ManifestListWriter,
     bounding_partition_values: &Rectangle,
 ) -> Result<SelectedManifest, Error> {
     let mut selected_state = None;
@@ -126,7 +119,7 @@ pub(crate) fn select_manifest_partitioned(
                 continue;
             }
             _ => {
-                manifest_list_writer.append_ser(manifest)?;
+                manifest_list_writer.append_ser(&manifest)?;
                 continue;
             }
         }
@@ -141,8 +134,8 @@ pub(crate) fn select_manifest_partitioned(
 
 /// Select the manifest with the smallest number of rows.
 pub(crate) fn select_manifest_unpartitioned(
-    manifest_list_reader: ManifestListReader<&[u8]>,
-    manifest_list_writer: &mut apache_avro::Writer<Vec<u8>>,
+    manifest_list_reader: ManifestListReader<impl Read>,
+    manifest_list_writer: &mut ManifestListWriter,
 ) -> Result<SelectedManifest, Error> {
     let mut selected_state = None;
     let mut file_count_all_entries = 0;
@@ -168,7 +161,7 @@ pub(crate) fn select_manifest_unpartitioned(
             selected_state = Some((Some(row_count), manifest));
             continue;
         } else {
-            manifest_list_writer.append_ser(manifest)?;
+            manifest_list_writer.append_ser(&manifest)?;
             continue;
         }
     }

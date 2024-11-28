@@ -15,7 +15,7 @@ use crate::{error::Error, partition::BoundPartitionField};
 use super::{
     partition::PartitionSpec,
     schema::Schema,
-    table_metadata::FormatVersion,
+    table_metadata::{FormatVersion, TableMetadata},
     types::{PrimitiveType, StructType, Type},
     values::{Struct, Value},
 };
@@ -45,12 +45,23 @@ impl ManifestEntry {
         ManifestEntryBuilder::default()
     }
 
-    pub fn status_mut(&mut self) -> &mut Status {
-        &mut self.status
-    }
-
-    pub fn sequence_number_mut(&mut self) -> &mut Option<i64> {
-        &mut self.sequence_number
+    /// Change a field status to `Existing`, and assign the appropriate sequence number from the table metadata.
+    pub fn mark_existing(&mut self, table_metadata: &TableMetadata) -> Result<(), Error> {
+        self.status = Status::Existing;
+        let entry_snapshot_id = self
+            .snapshot_id
+            .ok_or(apache_avro::Error::DeserializeValue(
+                "snapshot_id missing in ManifestEntry.".to_owned(),
+            ))?;
+        let entry_sequence_number =
+            table_metadata
+                .sequence_number(entry_snapshot_id)
+                .ok_or(Error::NotFound(
+                    "Snapshot Id".to_owned(),
+                    entry_snapshot_id.to_string(),
+                ))?;
+        self.sequence_number = Some(entry_sequence_number);
+        Ok(())
     }
 }
 
@@ -520,9 +531,7 @@ impl DataFile {
     pub fn builder() -> DataFileBuilder {
         DataFileBuilder::default()
     }
-}
 
-impl DataFile {
     pub(crate) fn try_from_v2(
         value: DataFileV2,
         schema: &Schema,

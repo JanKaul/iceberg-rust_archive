@@ -29,9 +29,11 @@ sqlparser = { workspace = true }
 thrift = { version = "0.17.0", default-features = false }
 thiserror = { workspace = true }
 derive-getters = { workspace = true }
-iceberg-rust-spec = { path = "../iceberg-rust-spec", version = "0.5.8" }
 smallvec = { version = "1.13.2", features = ["const_generics"] }
+
+iceberg-rust-spec = { path = "../iceberg-rust-spec", version = "0.5.8" }
 
 [dev-dependencies]
 chrono = { workspace = true }
 
+iceberg-rust-spec = { path = "../iceberg-rust-spec", features = ["testutils"], version = "0.5.8" }

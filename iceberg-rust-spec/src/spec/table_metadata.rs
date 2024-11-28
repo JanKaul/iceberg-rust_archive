@@ -95,7 +95,7 @@ pub struct TableMetadata {
     /// ID of the main branch in refs.
     #[builder(default)]
     pub current_snapshot_id: Option<i64>,
-    ///A list of valid snapshots. Valid snapshots are snapshots for which all
+    /// A list of valid snapshots. Valid snapshots are snapshots for which all
     /// data files exist in the file system. A data file must not be deleted
     /// from the file system until the last snapshot in which it was listed is
     /// garbage collected.
