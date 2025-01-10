@@ -38,6 +38,7 @@ use iceberg_rust::{
 };
 use object_store::ObjectStore;
 use schema::schema_to_glue;
+use crate::utils::{get_parameters, METADATA_LOCATION};
 
 use crate::error::Error;
 
@@ -51,6 +52,7 @@ pub struct GlueCatalog {
 
 pub mod error;
 pub mod schema;
+mod utils;
 
 impl GlueCatalog {
     pub fn new(
@@ -239,10 +241,9 @@ impl Catalog for GlueCatalog {
                 "Glue create table didn't return a table.".to_owned(),
             ))?;
 
-        let metadata_location = table
-            .storage_descriptor()
-            .and_then(|x| x.location())
-            .ok_or(IcebergError::NotFound(format!("Table {}", table.name())))?;
+        let metadata_location = table.parameters().
+            and_then(|parameter| parameter.get(METADATA_LOCATION))
+            .ok_or(IcebergError::NotFound(format!("Glue table {} metadata location not found", &table.name())))?;
 
         let version_id = table
             .version_id()
@@ -309,10 +310,11 @@ impl Catalog for GlueCatalog {
                     .name(identifier.name())
                     .storage_descriptor(
                         StorageDescriptor::builder()
-                            .location(&metadata_location)
+                            .location(&location)
                             .set_columns(schema_to_glue(schema.fields()).ok())
-                            .build(),
+                            .build()
                     )
+                    .set_parameters(Some(get_parameters(&metadata_location)))
                     .build()
                     .map_err(Error::from)?,
             )
@@ -674,11 +676,8 @@ impl Catalog for GlueCatalog {
             .table_input(
                 TableInput::builder()
                     .name(identifier.name())
-                    .storage_descriptor(
-                        StorageDescriptor::builder()
-                            .location(&metadata_location)
-                            .set_columns(schema_to_glue(schema.fields()).ok())
-                            .build(),
+                    .set_parameters(
+                        Some(get_parameters(&metadata_location))
                     )
                     .build()
                     .map_err(Error::from)?,
@@ -782,11 +781,8 @@ impl Catalog for GlueCatalog {
             .table_input(
                 TableInput::builder()
                     .name(identifier.name())
-                    .storage_descriptor(
-                        StorageDescriptor::builder()
-                            .location(&metadata_location)
-                            .set_columns(schema_to_glue(schema.fields()).ok())
-                            .build(),
+                    .set_parameters(
+                    Some(get_parameters(&metadata_location))
                     )
                     .build()
                     .map_err(Error::from)?,
@@ -868,9 +864,16 @@ impl Catalog for GlueCatalog {
                     .name(identifier.name())
                     .storage_descriptor(
                         StorageDescriptor::builder()
-                            .location(metadata_location)
+                            .location(metadata.location.clone())
                             .set_columns(schema_to_glue(schema.fields()).ok())
                             .build(),
+                    )
+                    .set_parameters(
+                        Some(
+                            HashMap::from([
+
+                            ])
+                        )
                     )
                     .build()
                     .map_err(Error::from)?,
