@@ -108,7 +108,8 @@ impl<'view> Transaction<'view> {
             .and_modify(|mut x| {
                 if let TableOperation::Append {
                     branch: _,
-                    files: old,
+                    data_files: old,
+                    delete_files: _,
                     additional_summary: old_lineage,
                 } = &mut x
                 {
@@ -121,7 +122,44 @@ impl<'view> Transaction<'view> {
             })
             .or_insert(TableOperation::Append {
                 branch: self.branch.clone(),
-                files,
+                data_files: files,
+                delete_files: Vec::new(),
+                additional_summary: Some(HashMap::from_iter(vec![(
+                    REFRESH_STATE.to_owned(),
+                    refresh_state,
+                )])),
+            });
+        Ok(self)
+    }
+
+    /// Append files to the storage table
+    pub fn delete(
+        mut self,
+        files: Vec<DataFile>,
+        refresh_state: RefreshState,
+    ) -> Result<Self, Error> {
+        let refresh_state = serde_json::to_string(&refresh_state)?;
+        self.storage_table_operations
+            .entry(APPEND_KEY.to_owned())
+            .and_modify(|mut x| {
+                if let TableOperation::Append {
+                    branch: _,
+                    data_files: _,
+                    delete_files: old,
+                    additional_summary: old_lineage,
+                } = &mut x
+                {
+                    old.extend_from_slice(&files);
+                    *old_lineage = Some(HashMap::from_iter(vec![(
+                        REFRESH_STATE.to_owned(),
+                        refresh_state.clone(),
+                    )]));
+                }
+            })
+            .or_insert(TableOperation::Append {
+                branch: self.branch.clone(),
+                data_files: Vec::new(),
+                delete_files: files,
                 additional_summary: Some(HashMap::from_iter(vec![(
                     REFRESH_STATE.to_owned(),
                     refresh_state,

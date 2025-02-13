@@ -160,7 +160,7 @@ pub async fn test_equality_delete() {
 
     table
         .new_transaction(None)
-        .append(files)
+        .append_delete(files)
         .commit()
         .await
         .unwrap();

@@ -113,17 +113,18 @@ impl<'table> TableTransaction<'table> {
     /// # Examples
     /// ```
     /// let transaction = table.new_transaction(None)
-    ///     .append(data_files)
+    ///     .append_data(data_files)
     ///     .commit()
     ///     .await?;
     /// ```
-    pub fn append(mut self, files: Vec<DataFile>) -> Self {
+    pub fn append_data(mut self, files: Vec<DataFile>) -> Self {
         self.operations
             .entry(APPEND_KEY.to_owned())
             .and_modify(|mut x| {
                 if let Operation::Append {
                     branch: _,
-                    files: old,
+                    data_files: old,
+                    delete_files: _,
                     additional_summary: None,
                 } = &mut x
                 {
@@ -132,7 +133,49 @@ impl<'table> TableTransaction<'table> {
             })
             .or_insert(Operation::Append {
                 branch: self.branch.clone(),
-                files,
+                data_files: files,
+                delete_files: Vec::new(),
+                additional_summary: None,
+            });
+        self
+    }
+    /// Appends delete files to the table
+    ///
+    /// This operation adds files that mark records for deletion in the table's current snapshot.
+    /// Multiple delete operations in the same transaction will be combined. The delete files
+    /// specify which records should be removed when reading the table.
+    ///
+    /// # Arguments
+    /// * `files` - Vector of delete files to append to the table
+    ///
+    /// # Returns
+    /// * `Self` - The transaction builder for method chaining
+    ///
+    /// # Examples
+    /// ```
+    /// let transaction = table.new_transaction(None)
+    ///     .append_delete(delete_files)
+    ///     .commit()
+    ///     .await?;
+    /// ```
+    pub fn append_delete(mut self, files: Vec<DataFile>) -> Self {
+        self.operations
+            .entry(APPEND_KEY.to_owned())
+            .and_modify(|mut x| {
+                if let Operation::Append {
+                    branch: _,
+                    data_files: _,
+                    delete_files: old,
+                    additional_summary: None,
+                } = &mut x
+                {
+                    old.extend_from_slice(&files)
+                }
+            })
+            .or_insert(Operation::Append {
+                branch: self.branch.clone(),
+                data_files: Vec::new(),
+                delete_files: files,
                 additional_summary: None,
             });
         self

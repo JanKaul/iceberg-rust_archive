@@ -8,7 +8,7 @@ use bytes::Bytes;
 use iceberg_rust_spec::manifest_list::{
     manifest_list_schema_v1, manifest_list_schema_v2, ManifestListEntry,
 };
-use iceberg_rust_spec::snapshot::Snapshot;
+use iceberg_rust_spec::snapshot::{Operation as SnapshotOperation, Snapshot};
 use iceberg_rust_spec::spec::table_metadata::TableMetadata;
 use iceberg_rust_spec::spec::{
     manifest::{partition_value_schema, DataFile, ManifestEntry, Status},
@@ -56,7 +56,8 @@ pub enum Operation {
     /// Append new files to the table
     Append {
         branch: Option<String>,
-        files: Vec<DataFile>,
+        data_files: Vec<DataFile>,
+        delete_files: Vec<DataFile>,
         additional_summary: Option<HashMap<String, String>>,
     },
     // /// Quickly append new files to the table
@@ -95,13 +96,23 @@ impl Operation {
         match self {
             Operation::Append {
                 branch,
-                files: new_files,
+                data_files,
+                delete_files,
                 additional_summary,
             } => {
                 let partition_fields =
                     table_metadata.current_partition_fields(branch.as_deref())?;
                 let schema = table_metadata.current_schema(branch.as_deref())?;
                 let old_snapshot = table_metadata.current_snapshot(branch.as_deref())?;
+
+                let snapshot_operation = match (data_files.len(), delete_files.len()) {
+                    (0, 0) => Err(Error::InvalidFormat(
+                        "Empty data and delete files".to_string(),
+                    )),
+                    (_, 0) => Ok(SnapshotOperation::Append),
+                    (0, _) => Ok(SnapshotOperation::Delete),
+                    (_, _) => Ok(SnapshotOperation::Overwrite),
+                }?;
 
                 let old_manifest_list_bytes_opt =
                     prefetch_manifest_list(old_snapshot, &object_store);
@@ -111,8 +122,9 @@ impl Operation {
                     .map(|x| x.name())
                     .collect::<SmallVec<[_; 4]>>();
 
-                let bounding_partition_values = new_files
+                let bounding_partition_values = delete_files
                     .iter()
+                    .chain(data_files.iter())
                     .try_fold(None, |acc, x| {
                         let node = partition_struct_to_vec(x.partition(), &partition_column_names)?;
                         let Some(mut acc) = acc else {
@@ -183,7 +195,7 @@ impl Operation {
 
                 let n_splits = compute_n_splits(
                     existing_file_count,
-                    new_files.len(),
+                    delete_files.len() + data_files.len(),
                     selected_manifest_file_count,
                 );
 
@@ -201,15 +213,19 @@ impl Operation {
                 let snapshot_id = generate_snapshot_id();
                 let commit_uuid = &uuid::Uuid::new_v4().to_string();
 
-                let new_datafile_iter = new_files.into_iter().map(|data_file| {
-                    ManifestEntry::builder()
-                        .with_format_version(table_metadata.format_version)
-                        .with_status(Status::Added)
-                        .with_data_file(data_file)
-                        .build()
-                        .map_err(crate::spec::error::Error::from)
-                        .map_err(Error::from)
-                });
+                let new_datafile_iter =
+                    delete_files
+                        .into_iter()
+                        .chain(data_files.into_iter())
+                        .map(|data_file| {
+                            ManifestEntry::builder()
+                                .with_format_version(table_metadata.format_version)
+                                .with_status(Status::Added)
+                                .with_data_file(data_file)
+                                .build()
+                                .map_err(crate::spec::error::Error::from)
+                                .map_err(Error::from)
+                        });
 
                 let manifest_schema = ManifestEntry::schema(
                     &partition_value_schema(&partition_fields)?,
@@ -329,7 +345,7 @@ impl Operation {
                     .with_manifest_list(new_manifest_list_location)
                     .with_sequence_number(table_metadata.last_sequence_number + 1)
                     .with_summary(Summary {
-                        operation: iceberg_rust_spec::spec::snapshot::Operation::Append,
+                        operation: snapshot_operation,
                         other: additional_summary.unwrap_or_default(),
                     })
                     .with_schema_id(*schema.schema_id());

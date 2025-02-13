@@ -202,7 +202,7 @@ pub async fn refresh_materialized_view(
                 .new_transaction(branch.as_deref())
                 .append(pos_files, refresh_state.clone())?;
             let transaction = if !neg_files.is_empty() {
-                transaction.append(neg_files, refresh_state)?
+                transaction.delete(neg_files, refresh_state)?
             } else {
                 transaction
             };

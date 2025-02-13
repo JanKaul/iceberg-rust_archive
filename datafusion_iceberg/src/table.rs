@@ -776,7 +776,7 @@ impl DataSink for IcebergDataSink {
 
         table
             .new_transaction(self.0.branch.as_deref())
-            .append(metadata_files)
+            .append_data(metadata_files)
             .commit()
             .await
             .map_err(DataFusionIcebergError::from)?;
