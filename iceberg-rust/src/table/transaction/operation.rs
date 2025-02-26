@@ -396,18 +396,6 @@ impl Operation {
                     .map(|x| x.name())
                     .collect::<SmallVec<[_; 4]>>();
 
-                let bounding_partition_values = files
-                    .iter()
-                    .try_fold(None, |acc, x| {
-                        let node = partition_struct_to_vec(x.partition(), &partition_column_names)?;
-                        let Some(mut acc) = acc else {
-                            return Ok::<_, Error>(Some(Rectangle::new(node.clone(), node)));
-                        };
-                        acc.expand_with_node(node);
-                        Ok(Some(acc))
-                    })?
-                    .ok_or(Error::NotFound("Bounding partition values".to_owned()))?;
-
                 let manifest_list_schema = match table_metadata.format_version {
                     FormatVersion::V1 => manifest_list_schema_v1(),
                     FormatVersion::V2 => manifest_list_schema_v2(),
@@ -421,13 +409,13 @@ impl Operation {
                 let snapshot_id = generate_snapshot_id();
                 let sequence_number = table_metadata.last_sequence_number + 1;
 
-                let new_datafile_iter = files.into_iter().map(|data_file| {
+                let new_datafile_iter = files.iter().map(|data_file| {
                     ManifestEntry::builder()
                         .with_format_version(table_metadata.format_version)
                         .with_status(Status::Added)
                         .with_snapshot_id(snapshot_id)
                         .with_sequence_number(sequence_number)
-                        .with_data_file(data_file)
+                        .with_data_file(data_file.clone())
                         .build()
                         .map_err(crate::spec::error::Error::from)
                         .map_err(Error::from)
@@ -469,6 +457,18 @@ impl Operation {
 
                     manifest_list_writer.append_ser(manifest)?;
                 } else {
+                    let bounding_partition_values = files
+                        .iter()
+                        .try_fold(None, |acc, x| {
+                            let node = partition_struct_to_vec(x.partition(), &partition_column_names)?;
+                            let Some(mut acc) = acc else {
+                                return Ok::<_, Error>(Some(Rectangle::new(node.clone(), node)));
+                            };
+                            acc.expand_with_node(node);
+                            Ok(Some(acc))
+                        })?
+                        .ok_or(Error::NotFound("Bounding partition values".to_owned()))?;
+
                     // Split datafiles
                     let splits = split_datafiles(
                         new_datafile_iter,
